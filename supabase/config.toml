@@ -1,0 +1,11 @@
+project_id = "auctionfigure"
+
+[api]
+enabled = true
+port = 54321
+
+[db]
+port = 54322
+
+[functions.health]
+verify_jwt = false
