@@ -9,88 +9,68 @@ import { GlobeFallback } from './GlobeFallback';
 import type { Spot } from '@/types/spot';
 
 // ---------------------------------------------------------------------------
-// WebGL context probe — attempts creation with increasingly relaxed settings
+// WebGL support detection + renderer attribute selection
 // ---------------------------------------------------------------------------
 
-interface ContextProbeResult {
-  /** Whether any WebGL context could be created. */
-  supported: boolean;
-  /**
-   * The most permissive set of WebGLContextAttributes that succeeded.
-   * undefined when supported === false.
-   */
-  attrs?: WebGLContextAttributes;
-  /** Human-readable explanation for logging. */
-  reason: string;
+/**
+ * STEP 1 — Detection: is WebGL available at all?
+ *
+ * Uses the absolute minimal check: plain getContext() with NO extra attributes.
+ * This is the canonical detection pattern used by Modernizr, Three.js's own
+ * WebGL detector, and get.webgl.org.
+ *
+ * Critically: we do NOT pass antialias / powerPreference / depth / stencil
+ * here — those are renderer settings, not detection settings. Passing them
+ * to getContext() during detection was the root cause of false negatives:
+ * some drivers return null for the attributed variant even when a bare
+ * getContext('webgl') would succeed just fine.
+ */
+function detectWebGLSupport(): boolean {
+  if (typeof window === 'undefined') return true; // SSR — defer to client
+
+  try {
+    const canvas = document.createElement('canvas');
+    // No attributes — purely checking API availability.
+    const ctx =
+      canvas.getContext('webgl') ||
+      canvas.getContext('experimental-webgl');
+
+    if (!ctx) {
+      console.warn('[Globe] detectWebGLSupport: getContext("webgl") returned null — WebGL unavailable.');
+      return false;
+    }
+
+    // Release the test context immediately so GPU resources aren't held.
+    const lose = (ctx as WebGLRenderingContext).getExtension('WEBGL_lose_context');
+    lose?.loseContext();
+
+    console.info('[Globe] detectWebGLSupport: WebGL confirmed available.');
+    return true;
+  } catch (err) {
+    console.warn('[Globe] detectWebGLSupport: exception during detection:', err);
+    return false;
+  }
 }
 
 /**
- * Probes WebGL context creation with three progressively relaxed attribute
- * sets, mirroring what production Three.js sites do when strict settings fail
- * on hybrid-GPU / low-power hardware.
+ * STEP 2 — Renderer attrs: what settings to give to <Canvas gl={...}>?
  *
- * Attempt order:
- *   1. antialias ON  + powerPreference "default"   (good quality, compatible)
- *   2. antialias OFF + powerPreference "default"   (no MSAA — most permissive)
- *   3. antialias OFF + powerPreference "low-power"  (final safety net)
+ * Deliberately uses powerPreference="default" (not "high-performance").
+ * Three.js historically defaulted to "high-performance" which causes
+ * context-creation failures on switchable-GPU laptops (Intel+Nvidia,
+ * AMD+Nvidia) even when basic WebGL is fully available. "default" lets
+ * the OS route to whichever GPU it prefers, which is always more compatible.
  *
- * Note: we deliberately avoid "high-performance" — Three.js used to default
- * to that, which caused context-creation failures on switchable-GPU laptops
- * even when basic WebGL was fully available.
+ * antialias is still enabled here; if Canvas creation fails at runtime
+ * the error boundary will catch it and show the fallback.
  */
-function probeWebGLContext(): ContextProbeResult {
-  if (typeof window === 'undefined') {
-    // SSR — cannot probe, assume supported so Canvas renders after hydration.
-    return { supported: true, reason: 'SSR environment — deferred to client' };
-  }
-
-  const candidates: Array<{ attrs: WebGLContextAttributes; label: string }> = [
-    {
-      attrs: { antialias: true,  powerPreference: 'default', alpha: true, depth: true, stencil: false },
-      label: 'antialias=true, powerPreference=default',
-    },
-    {
-      attrs: { antialias: false, powerPreference: 'default', alpha: true, depth: true, stencil: false },
-      label: 'antialias=false, powerPreference=default',
-    },
-    {
-      attrs: { antialias: false, powerPreference: 'low-power', alpha: true, depth: true, stencil: false },
-      label: 'antialias=false, powerPreference=low-power',
-    },
-  ];
-
-  for (const { attrs, label } of candidates) {
-    try {
-      const testCanvas = document.createElement('canvas');
-      testCanvas.width = 1;
-      testCanvas.height = 1;
-
-      // Try WebGL2 first, fall back to WebGL1.
-      const ctx =
-        (testCanvas.getContext('webgl2', attrs) as WebGLRenderingContext | null) ||
-        (testCanvas.getContext('webgl',  attrs) as WebGLRenderingContext | null) ||
-        (testCanvas.getContext('experimental-webgl', attrs) as WebGLRenderingContext | null);
-
-      if (ctx) {
-        // Immediately lose the test context so we don't hold GPU resources.
-        const loseExt = ctx.getExtension('WEBGL_lose_context');
-        loseExt?.loseContext();
-
-        console.info(`[Globe] WebGL probe succeeded with: ${label}`);
-        return { supported: true, attrs, reason: label };
-      } else {
-        console.warn(`[Globe] WebGL probe: getContext returned null for ${label}`);
-      }
-    } catch (err) {
-      console.warn(`[Globe] WebGL probe: exception for ${label}:`, err);
-    }
-  }
-
-  return {
-    supported: false,
-    reason: 'All WebGL context creation attempts failed (antialias on/off, all powerPreference values)',
-  };
-}
+const RELAXED_GL_ATTRS: WebGLContextAttributes = {
+  antialias: true,
+  powerPreference: 'default',
+  alpha: true,
+  depth: true,
+  stencil: false,
+};
 
 // ---------------------------------------------------------------------------
 // React Error Boundary — catches runtime errors thrown inside <Canvas>
@@ -184,30 +164,21 @@ export const Globe: React.FC<GlobeProps> = ({ spots, onSelectSpot }) => {
    * false → probe ran, WebGL is available; glAttrs holds the attrs to use
    * true  → probe ran, WebGL definitively unavailable; show GlobeFallback
    */
+  /**
+   * null  → detection not yet run (before first useEffect on client)
+   * false → detection passed; Canvas is safe to mount
+   * true  → detection failed or runtime error; show GlobeFallback
+   */
   const [webGLFailed, setWebGLFailed] = useState<boolean | null>(null);
-  const [glAttrs, setGlAttrs] = useState<WebGLContextAttributes>({
-    antialias: true,
-    powerPreference: 'default',
-    alpha: true,
-    depth: true,
-    stencil: false,
-  });
 
   useEffect(() => {
-    const result = probeWebGLContext();
-
-    if (!result.supported) {
-      console.warn('[Globe] WebGL unavailable — reason:', result.reason);
+    // detectWebGLSupport() uses a bare, no-attribute getContext() call —
+    // the most permissive possible check, matching get.webgl.org's approach.
+    if (!detectWebGLSupport()) {
       setWebGLFailed(true);
-      return;
+    } else {
+      setWebGLFailed(false);
     }
-
-    // Use the exact attrs that succeeded in the probe so Canvas creation
-    // is guaranteed to use a compatible configuration.
-    if (result.attrs) {
-      setGlAttrs(result.attrs);
-    }
-    setWebGLFailed(false);
   }, []);
 
   // While the probe hasn't run yet (first SSR→client paint), render nothing
@@ -247,12 +218,13 @@ export const Globe: React.FC<GlobeProps> = ({ spots, onSelectSpot }) => {
           camera={{ position: [0, 0, 6.2], fov: 45 }}
           style={{ background: 'transparent', width: '100%', height: '100%' }}
           /**
-           * Use the attrs confirmed to work by probeWebGLContext().
-           * Critically: powerPreference is "default" (not "high-performance"),
-           * which fixes context-creation failures on switchable-GPU laptops
-           * where basic WebGL works fine but the high-perf GPU request fails.
+           * RELAXED_GL_ATTRS uses powerPreference="default" (not the
+           * "high-performance" Three.js used to default to) to prevent
+           * context-creation failures on switchable-GPU laptops.
+           * If Canvas creation fails despite this, the error boundary above
+           * will catch it and trigger the fallback UI.
            */
-          gl={glAttrs}
+          gl={RELAXED_GL_ATTRS}
           onCreated={({ gl }) => {
             const ctx = gl.getContext();
             if (!ctx) {
