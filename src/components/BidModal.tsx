@@ -850,7 +850,7 @@ export const BidModal: React.FC<BidModalProps> = ({ spot, onClose, onBidSuccess 
               lineHeight: '1.4',
             }}
           >
-            All payments are final. By proceeding, you agree to the{' '}
+            By continuing, you agree to our{' '}
             <a
               href="/terms"
               target="_blank"
@@ -859,7 +859,7 @@ export const BidModal: React.FC<BidModalProps> = ({ spot, onClose, onBidSuccess 
             >
               Terms &amp; Policy
             </a>
-            .
+            . All payments are final.
           </p>
         </form>
       </div>
