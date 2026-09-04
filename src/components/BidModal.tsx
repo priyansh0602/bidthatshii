@@ -2,9 +2,35 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
-import { placeBid } from '@/lib/bids';
 import { supabase } from '@/lib/supabase';
 import type { Spot } from '@/types/spot';
+
+// Helper to dynamically load the Razorpay checkout script
+function loadRazorpayCheckoutScript(): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (typeof window === 'undefined') {
+      resolve(false);
+      return;
+    }
+    if ((window as unknown as { Razorpay?: unknown }).Razorpay) {
+      resolve(true);
+      return;
+    }
+    const existingScript = document.getElementById('razorpay-checkout-script');
+    if (existingScript) {
+      existingScript.addEventListener('load', () => resolve(true));
+      existingScript.addEventListener('error', () => resolve(false));
+      return;
+    }
+    const script = document.createElement('script');
+    script.id = 'razorpay-checkout-script';
+    script.src = 'https://checkout.razorpay.com/v1/checkout.js';
+    script.async = true;
+    script.onload = () => resolve(true);
+    script.onerror = () => resolve(false);
+    document.body.appendChild(script);
+  });
+}
 
 interface BidModalProps {
   spot: Spot | null;
@@ -191,33 +217,148 @@ export const BidModal: React.FC<BidModalProps> = ({ spot, onClose, onBidSuccess 
         logoUrl ||
         `https://www.google.com/s2/favicons?sz=128&domain_url=${encodeURIComponent(normalizedUrl)}`;
 
-      const result = await placeBid(spot.id, normalizedUrl, targetLogo, undefined, bidAmount);
+      // 1. Ensure Razorpay checkout script is loaded
+      const scriptLoaded = await loadRazorpayCheckoutScript();
+      if (!scriptLoaded) {
+        setSubmitting(false);
+        setMessage({
+          text: 'Could not load Razorpay payment gateway. Please check your connection and try again.',
+          success: false,
+        });
+        return;
+      }
 
-      // Detect rate-limit responses from the database function.
-      const rateLimited =
-        !result.success &&
-        typeof result.message === 'string' &&
-        result.message.toLowerCase().includes('too many');
-
-      setIsRateLimited(rateLimited);
-      setMessage({
-        text: result.message || (result.success ? 'Region claimed successfully!' : 'Claim failed'),
-        success: result.success,
+      // 2. Create payment order server-side with verified charge delta
+      const orderRes = await fetch('/api/create-payment-order', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          spotId: spot.id,
+          advertiserUrl: normalizedUrl,
+          bidAmount,
+        }),
       });
 
-      if (result.success) {
-        if (onBidSuccess) onBidSuccess();
-        setTimeout(() => {
-          onClose();
-        }, 1200);
+      const orderData = await orderRes.json();
+
+      if (!orderRes.ok) {
+        setSubmitting(false);
+        if (orderRes.status === 429) {
+          setIsRateLimited(true);
+        }
+        setMessage({
+          text: orderData.error || 'Failed to create payment order. Please try again.',
+          success: false,
+        });
+        return;
       }
+
+      const { orderId, amount, currency, keyId } = orderData;
+
+      // 3. Configure and open Razorpay Checkout popup
+      const rzpOptions = {
+        key: keyId,
+        amount,
+        currency: currency || 'INR',
+        name: 'BidThatShii',
+        description: `Claim ${spot.display_name}`,
+        order_id: orderId,
+        handler: async (paymentResponse: {
+          razorpay_payment_id: string;
+          razorpay_order_id: string;
+          razorpay_signature: string;
+        }) => {
+          setSubmitting(true);
+          setMessage({
+            text: 'Verifying payment and claiming spot…',
+            success: true,
+          });
+
+          try {
+            const verifyRes = await fetch('/api/verify-payment-and-bid', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                razorpay_payment_id: paymentResponse.razorpay_payment_id,
+                razorpay_order_id: paymentResponse.razorpay_order_id,
+                razorpay_signature: paymentResponse.razorpay_signature,
+                spotId: spot.id,
+                advertiserUrl: normalizedUrl,
+                logoUrl: targetLogo,
+                bidAmount,
+              }),
+            });
+
+            const verifyData = await verifyRes.json();
+
+            const rateLimited =
+              !verifyData.success &&
+              typeof verifyData.message === 'string' &&
+              verifyData.message.toLowerCase().includes('too many');
+
+            setIsRateLimited(rateLimited);
+            setMessage({
+              text:
+                verifyData.message ||
+                (verifyData.success ? 'Region claimed successfully!' : 'Payment verified but claim failed'),
+              success: Boolean(verifyData.success),
+            });
+
+            if (verifyData.success) {
+              if (onBidSuccess) onBidSuccess();
+              setTimeout(() => {
+                onClose();
+              }, 1200);
+            }
+          } catch (err) {
+            setMessage({
+              text: err instanceof Error ? err.message : 'Error verifying payment and placing bid.',
+              success: false,
+            });
+          } finally {
+            setSubmitting(false);
+          }
+        },
+        modal: {
+          ondismiss: () => {
+            // User closed/cancelled without paying — return to form without treating as error
+            setSubmitting(false);
+            setMessage({
+              text: 'Payment cancelled. You can try again whenever you are ready.',
+              success: false,
+            });
+          },
+        },
+        theme: {
+          color: '#e11d48',
+        },
+      };
+
+      const RazorpayConstructor = (window as unknown as {
+        Razorpay: new (opts: unknown) => {
+          open: () => void;
+          on: (event: string, callback: (resp: unknown) => void) => void;
+        };
+      }).Razorpay;
+
+      const rzp = new RazorpayConstructor(rzpOptions);
+
+      rzp.on('payment.failed', (resp: unknown) => {
+        setSubmitting(false);
+        const errObj = resp as { error?: { description?: string } };
+        setMessage({
+          text: errObj?.error?.description || 'Payment was unsuccessful. Please try again.',
+          success: false,
+        });
+      });
+
+      rzp.open();
     } catch (err) {
+      setSubmitting(false);
       setMessage({
-        text: err instanceof Error ? err.message : 'Error placing bid',
+        text: err instanceof Error ? err.message : 'Error starting payment',
         success: false,
       });
-    } finally {
-      setSubmitting(false);
     }
   };
 
@@ -690,7 +831,7 @@ export const BidModal: React.FC<BidModalProps> = ({ spot, onClose, onBidSuccess 
             }}
           >
             {submitting
-              ? 'Claiming…'
+              ? 'Processing…'
               : fetchingLogo
               ? 'Verifying URL…'
               : urlReachable === false
