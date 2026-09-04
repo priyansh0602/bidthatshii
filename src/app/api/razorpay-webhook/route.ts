@@ -169,27 +169,30 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // No matching bid_event found — this is an orphaned payment
-    console.error(
-      '[razorpay-webhook] ⚠️ ORPHANED SUCCESSFUL PAYMENT DETECTED: ' +
-      'Payment was captured by Razorpay, but no matching bid_event exists in the database. ' +
-      'The user likely closed their browser before the frontend /api/verify-payment-and-bid flow completed. ' +
-      'Manual investigation/reconciliation required.',
-      {
-        paymentId,
-        orderId,
-        amount,
-        currency,
-        email: payment?.email,
-        contact: payment?.contact,
-        notes: payment?.notes,
-        capturedAt: payment?.created_at,
-        timestamp: new Date().toISOString(),
-      }
+    // No matching bid_event found on initial check.
+    // The webhook often arrives faster than the frontend's /api/verify-payment-and-bid flow completes.
+    // To avoid false-positive "ORPHANED PAYMENT" alarms, schedule a delayed retry check in the
+    // background and return HTTP 200 immediately to Razorpay.
+    console.log(
+      `[razorpay-webhook] No bid_event found immediately for payment ${paymentId}. Scheduling background verification retry window...`,
+      { paymentId, orderId }
     );
 
+    checkOrphanedPaymentWithRetry({
+      paymentId,
+      orderId,
+      amount,
+      currency,
+      email: payment?.email,
+      contact: payment?.contact,
+      notes: payment?.notes,
+      capturedAt: payment?.created_at,
+    }).catch((err) => {
+      console.error('[razorpay-webhook] Background retry failed unexpectedly:', err);
+    });
+
     return NextResponse.json(
-      { received: true, status: 'orphaned_payment_detected', paymentId, orderId },
+      { received: true, status: 'pending_verification', paymentId, orderId },
       { status: 200 }
     );
   } catch (err) {
@@ -199,4 +202,80 @@ export async function POST(req: NextRequest) {
       { status: 200 }
     );
   }
+}
+
+/**
+ * Background retry check to avoid false-positive orphaned payment alerts when
+ * webhooks arrive ahead of frontend RPC completion.
+ */
+async function checkOrphanedPaymentWithRetry(paymentDetails: {
+  paymentId: string;
+  orderId?: string;
+  amount?: number;
+  currency?: string;
+  email?: string;
+  contact?: string;
+  notes?: Record<string, unknown>;
+  capturedAt?: number;
+}) {
+  const { paymentId, orderId } = paymentDetails;
+  // Check after 7s (attempt 1), then after an additional 8s (attempt 2, 15s total)
+  const retryDelays = [7000, 8000];
+
+  for (let i = 0; i < retryDelays.length; i++) {
+    const delay = retryDelays[i];
+    await new Promise((resolve) => setTimeout(resolve, delay));
+
+    try {
+      const { data: bidEvent, error: dbError } = await supabaseAdmin
+        .from('bid_events')
+        .select('id, spot_id, advertiser_id_url, amount_charged, created_at')
+        .eq('payment_reference', paymentId)
+        .maybeSingle();
+
+      if (dbError) {
+        console.error('[razorpay-webhook] Database error during retry check:', {
+          paymentId,
+          orderId,
+          attempt: i + 1,
+          error: dbError.message,
+        });
+        continue;
+      }
+
+      if (bidEvent) {
+        console.log(
+          '[razorpay-webhook] Payment confirmed via webhook, bid_event found on retry — no action needed',
+          {
+            paymentId,
+            orderId,
+            bidEventId: bidEvent.id,
+            spotId: bidEvent.spot_id,
+            advertiserUrl: bidEvent.advertiser_id_url,
+            attempt: i + 1,
+          }
+        );
+        return;
+      }
+    } catch (err) {
+      console.error('[razorpay-webhook] Error during retry check:', {
+        paymentId,
+        orderId,
+        attempt: i + 1,
+        err,
+      });
+    }
+  }
+
+  // Still missing after retry window — genuinely orphaned payment
+  console.error(
+    '[razorpay-webhook] ⚠️ ORPHANED SUCCESSFUL PAYMENT DETECTED: ' +
+    'Payment was captured by Razorpay, but no matching bid_event exists in the database ' +
+    'after the retry window. The user likely closed their browser before the frontend ' +
+    '/api/verify-payment-and-bid flow completed. Manual investigation/reconciliation required.',
+    {
+      ...paymentDetails,
+      timestamp: new Date().toISOString(),
+    }
+  );
 }
