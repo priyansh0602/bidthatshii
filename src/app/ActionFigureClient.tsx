@@ -202,7 +202,12 @@ export default function ActionFigureClient({ initialSpots }: ActionFigureClientP
 
       {/* Footer */}
       <footer style={styles.footer}>
-        <p>BidThatShii • Real-Time Earth Cumulative Auction</p>
+        <p>
+          BidThatShii • Real-Time Earth Cumulative Auction •{' '}
+          <a href="/terms" style={styles.footerLink}>
+            Terms &amp; Policy
+          </a>
+        </p>
       </footer>
 
       {/* Bid Modal */}
@@ -454,5 +459,11 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: '13px',
     borderTop: '1px solid #f1f5f9',
     paddingTop: '24px',
+  },
+  footerLink: {
+    color: '#64748b',
+    textDecoration: 'underline',
+    fontWeight: 500,
+    transition: 'color 0.15s ease',
   },
 };

@@ -840,6 +840,27 @@ export const BidModal: React.FC<BidModalProps> = ({ spot, onClose, onBidSuccess 
               ? bidAmountError
               : `Pay $${youllPay} to Claim ${spot.display_name}`}
           </button>
+
+          <p
+            style={{
+              fontSize: '12px',
+              color: '#94a3b8',
+              textAlign: 'center',
+              margin: '12px 0 0 0',
+              lineHeight: '1.4',
+            }}
+          >
+            All payments are final. By proceeding, you agree to the{' '}
+            <a
+              href="/terms"
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ color: '#64748b', textDecoration: 'underline' }}
+            >
+              Terms &amp; Policy
+            </a>
+            .
+          </p>
         </form>
       </div>
     </div>
