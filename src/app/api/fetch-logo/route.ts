@@ -100,6 +100,115 @@ function isAllowedProtocol(protocol: string): boolean {
   return protocol === 'https:' || protocol === 'http:';
 }
 
+// ---------------------------------------------------------------------------
+// Image validation helper: verifies URL returns valid image with non-zero size
+// ---------------------------------------------------------------------------
+function isValidImageBuffer(buf: ArrayBuffer, contentType: string): boolean {
+  if (!buf || buf.byteLength === 0) return false;
+  const lowerType = contentType.toLowerCase();
+  if (lowerType.startsWith('image/')) return true;
+
+  if (lowerType === 'application/octet-stream' && buf.byteLength >= 4) {
+    const bytes = new Uint8Array(buf.slice(0, 4));
+    // ICO: 00 00 01 00
+    if (bytes[0] === 0 && bytes[1] === 0 && bytes[2] === 1 && bytes[3] === 0) return true;
+    // PNG: 89 50 4E 47
+    if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return true;
+    // JPG: FF D8 FF
+    if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return true;
+    // GIF: 47 49 46
+    if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) return true;
+  }
+  return false;
+}
+
+async function verifyImageUrl(url: string, timeoutMs = 3000): Promise<boolean> {
+  try {
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      return false;
+    }
+
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+    if (isPrivateOrLoopback(parsed.hostname)) return false;
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    const res = await fetch(url, {
+      method: 'GET',
+      signal: controller.signal,
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        Accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+      },
+    });
+    clearTimeout(timer);
+
+    // Google favicon service returns 404 with a valid default globe PNG when domain is unindexed
+    const isGoogleService = url.includes('google.com/s2/favicons');
+    const isOkStatus = (res.status >= 200 && res.status < 400) || (isGoogleService && res.status === 404);
+    if (!isOkStatus) return false;
+
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
+    if (contentType.includes('text/html') || contentType.includes('application/json')) {
+      return false;
+    }
+
+    const buf = await res.arrayBuffer();
+    return isValidImageBuffer(buf, contentType);
+  } catch {
+    return false;
+  }
+}
+
+function extractIconCandidatesFromHtml(html: string, origin: string): string[] {
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+
+  const addCandidate = (rawHref: string | undefined | null) => {
+    if (!rawHref) return;
+    const trimmed = rawHref.trim();
+    if (!trimmed || trimmed.startsWith('data:')) return;
+    try {
+      const resolved = new URL(trimmed, origin).href;
+      if (!seen.has(resolved)) {
+        seen.add(resolved);
+        candidates.push(resolved);
+      }
+    } catch {}
+  };
+
+  // 1. Apple touch icon
+  const appleMatches = html.matchAll(/<link[^>]+rel=["']apple-touch-icon(?:-precomposed)?["'][^>]+href=["']([^"']+)["']/gi);
+  for (const m of appleMatches) addCandidate(m[1]);
+  const appleMatchesRev = html.matchAll(/<link[^>]+href=["']([^"']+)["'][^>]+rel=["']apple-touch-icon(?:-precomposed)?["']/gi);
+  for (const m of appleMatchesRev) addCandidate(m[1]);
+
+  // 2. Standard icons
+  const iconMatches = html.matchAll(/<link[^>]+rel=["'](?:shortcut |alternate )?icon["'][^>]+href=["']([^"']+)["']/gi);
+  for (const m of iconMatches) addCandidate(m[1]);
+  const iconMatchesRev = html.matchAll(/<link[^>]+href=["']([^"']+)["'][^>]+rel=["'](?:shortcut |alternate )?icon["']/gi);
+  for (const m of iconMatchesRev) addCandidate(m[1]);
+
+  // 3. OpenGraph images
+  const ogMatches = html.matchAll(/<meta[^>]+(?:property|name)=["']og:image["'][^>]+content=["']([^"']+)["']/gi);
+  for (const m of ogMatches) addCandidate(m[1]);
+  const ogMatchesRev = html.matchAll(/<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']og:image["']/gi);
+  for (const m of ogMatchesRev) addCandidate(m[1]);
+
+  // 4. Twitter images
+  const twitterMatches = html.matchAll(/<meta[^>]+(?:property|name)=["']twitter:image["'][^>]+content=["']([^"']+)["']/gi);
+  for (const m of twitterMatches) addCandidate(m[1]);
+  const twitterMatchesRev = html.matchAll(/<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']twitter:image["']/gi);
+  for (const m of twitterMatchesRev) addCandidate(m[1]);
+
+  return candidates;
+}
+
 type FetchLogoResponse = {
   logoUrl: string | null;
   found: boolean;
@@ -184,33 +293,14 @@ export async function POST(req: NextRequest) {
     }
 
     const origin = parsedUrl.origin;
-
-    // Helper to resolve relative URLs to absolute
-    const resolveUrl = (href: string): string => {
-      try {
-        return new URL(href, origin).href;
-      } catch {
-        return href;
-      }
-    };
+    const domain = parsedUrl.hostname;
 
     // ---------------------------------------------------------------------------
-    // Step 1: Reachability check + HTML fetch (combined in one request)
-    //
-    // Status handling:
-    //   - 200–399  → reachable; parse HTML for icons
-    //   - 403      → reachable (bot-protection, not a missing site); no HTML
-    //   - other 4xx/5xx → unreachable (bad gateway, not found, etc.)
-    //   - throws   → unreachable (DNS error, timeout, connection refused)
-    //
-    // We send realistic browser headers so bot-protection systems (Cloudflare,
-    // Akamai, etc.) are less likely to block the request.  The old bot-named
-    // User-Agent string ("BidThatShiiBot/1.0") was sufficient reason for many
-    // WAFs to immediately return 403.
+    // Step 1: Reachability check + HTML fetch
     // ---------------------------------------------------------------------------
     let reachable = false;
-    let discoveredLogoUrl: string | null = null;
     let reachabilityError: string | undefined;
+    let htmlContent: string | null = null;
 
     try {
       const controller = new AbortController();
@@ -219,14 +309,11 @@ export async function POST(req: NextRequest) {
       const res = await fetch(parsedUrl.href, {
         signal: controller.signal,
         headers: {
-          // Mimic a Chrome 124 desktop browser on Windows — realistic enough to
-          // pass most bot-protection heuristics without being deceptive.
           'User-Agent':
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
           'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
           'Accept-Language': 'en-US,en;q=0.9',
           'Accept-Encoding': 'gzip, deflate, br',
-          // sec-fetch headers are sent by Chrome; their absence is a common bot signal.
           'Sec-Fetch-Dest': 'document',
           'Sec-Fetch-Mode': 'navigate',
           'Sec-Fetch-Site': 'none',
@@ -239,37 +326,12 @@ export async function POST(req: NextRequest) {
 
       if (res.status >= 200 && res.status < 400) {
         reachable = true;
-
-        // Attempt to parse HTML for icon links
         const contentType = res.headers.get('content-type') || '';
         if (contentType.includes('text/html') || contentType.includes('application/xhtml')) {
-          const html = await res.text();
-
-          // Priority 1: apple-touch-icon
-          const appleIconMatch =
-            html.match(/<link[^>]+rel=["']apple-touch-icon(?:-precomposed)?["'][^>]+href=["']([^"']+)["']/i) ||
-            html.match(/<link[^>]+href=["']([^"']+)["'][^>]+rel=["']apple-touch-icon(?:-precomposed)?["']/i);
-
-          // Priority 2: link rel="icon" or rel="shortcut icon"
-          const iconMatch =
-            html.match(/<link[^>]+rel=["'](?:shortcut )?icon["'][^>]+href=["']([^"']+)["']/i) ||
-            html.match(/<link[^>]+href=["']([^"']+)["'][^>]+rel=["'](?:shortcut )?icon["']/i);
-
-          // Priority 3: og:image
-          const ogImageMatch =
-            html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i) ||
-            html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i);
-
-          const candidate = appleIconMatch?.[1] || iconMatch?.[1] || ogImageMatch?.[1];
-          if (candidate) {
-            discoveredLogoUrl = resolveUrl(candidate.trim());
-          }
+          htmlContent = await res.text();
         }
       } else if (res.status === 403) {
-        // 403 typically means "this site exists but is blocking bots/scrapers."
-        // Treat the site as reachable so users aren't incorrectly told their
-        // real, live website is unreachable.  We won't have HTML to parse, so
-        // logo discovery will fall through to the favicon.ico / Google fallback.
+        // 403 typically indicates bot protection (e.g. Cloudflare) rather than missing site.
         reachable = true;
       } else {
         reachabilityError = `Site returned HTTP ${res.status}`;
@@ -283,7 +345,7 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // If unreachable, return immediately without a logo
+    // If unreachable, return immediately
     if (!reachable) {
       return NextResponse.json<FetchLogoResponse>({
         logoUrl: null,
@@ -294,37 +356,52 @@ export async function POST(req: NextRequest) {
     }
 
     // ---------------------------------------------------------------------------
-    // Step 2: Fallback to /favicon.ico if no icon found in HTML
+    // Step 2: Build airtight prioritized candidate list
+    //
+    // 1. Extracted icons from HTML (<link rel="icon">, apple-touch-icon, og:image)
+    // 2. {origin}/favicon.ico
+    // 3. Google Favicon Service (domain & domain_url fallbacks)
     // ---------------------------------------------------------------------------
-    if (!discoveredLogoUrl) {
-      const defaultFavicon = `${origin}/favicon.ico`;
-      try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 3000);
-        const favRes = await fetch(defaultFavicon, {
-          method: 'HEAD',
-          signal: controller.signal,
-        });
-        clearTimeout(timeoutId);
+    const candidateList: string[] = [];
 
-        if (favRes.ok) {
-          discoveredLogoUrl = defaultFavicon;
-        }
-      } catch {
-        // favicon.ico HEAD request failed — fall through to Google fallback
+    if (htmlContent) {
+      const extracted = extractIconCandidatesFromHtml(htmlContent, origin);
+      for (const cand of extracted) {
+        candidateList.push(cand);
+      }
+    }
+
+    // Direct root favicon guess
+    candidateList.push(`${origin}/favicon.ico`);
+
+    // Google Favicon Service fallbacks
+    candidateList.push(`https://www.google.com/s2/favicons?domain=${domain}&sz=128`);
+    candidateList.push(`https://www.google.com/s2/favicons?sz=128&domain_url=${encodeURIComponent(origin)}`);
+
+    // ---------------------------------------------------------------------------
+    // Step 3: Verify candidate returns a valid image (correct mime type & non-zero size)
+    // ---------------------------------------------------------------------------
+    let verifiedLogoUrl: string | null = null;
+
+    for (const candidate of candidateList) {
+      if (!candidate) continue;
+      const isValid = await verifyImageUrl(candidate);
+      if (isValid) {
+        verifiedLogoUrl = candidate;
+        break;
       }
     }
 
     // ---------------------------------------------------------------------------
-    // Step 3: Google Favicon Service as final fallback (always returns an image)
+    // Step 4: Final safety net placeholder (stored locally in /public)
     // ---------------------------------------------------------------------------
-    if (!discoveredLogoUrl) {
-      discoveredLogoUrl = `https://www.google.com/s2/favicons?sz=128&domain_url=${encodeURIComponent(origin)}`;
+    if (!verifiedLogoUrl) {
+      verifiedLogoUrl = '/default-globe.svg';
     }
 
     return NextResponse.json<FetchLogoResponse>({
-      logoUrl: discoveredLogoUrl,
-      found: Boolean(discoveredLogoUrl),
+      logoUrl: verifiedLogoUrl,
+      found: true,
       reachable: true,
     });
   } catch {
