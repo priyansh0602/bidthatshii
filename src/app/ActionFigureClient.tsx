@@ -27,6 +27,105 @@ export default function ActionFigureClient({ initialSpots }: ActionFigureClientP
   const [selectedSpot, setSelectedSpot] = useState<Spot | null>(null);
   const isModalOpen = selectedSpot !== null;
 
+  // Track post-redirect payment verification status
+  const [verificationStatus, setVerificationStatus] = useState<{
+    status: 'verifying' | 'success' | 'error';
+    message: string;
+  } | null>(null);
+
+  // Check URL on mount for Dodo return_url redirect parameters
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const params = new URLSearchParams(window.location.search);
+    const isDodoVerify = params.get('dodo_verify') === 'true';
+    const paymentId = params.get('payment_id') || params.get('paymentId');
+    const spotIdFromUrl = params.get('spot_id');
+
+    if (isDodoVerify && paymentId) {
+      let pendingBid: {
+        spotId: string;
+        spotDisplayName?: string;
+        advertiserUrl: string;
+        logoUrl: string;
+        bidAmount?: number;
+      } | null = null;
+
+      try {
+        const stored = sessionStorage.getItem('bidthatshii_pending_bid');
+        if (stored) {
+          pendingBid = JSON.parse(stored);
+        }
+      } catch (err) {
+        console.error('Error reading pending bid from sessionStorage:', err);
+      }
+
+      const spotId = pendingBid?.spotId || spotIdFromUrl;
+      const advertiserUrl = pendingBid?.advertiserUrl || params.get('advertiser_url');
+      const logoUrl =
+        pendingBid?.logoUrl ||
+        (advertiserUrl
+          ? `https://www.google.com/s2/favicons?sz=128&domain_url=${encodeURIComponent(advertiserUrl)}`
+          : '');
+      const bidAmount = pendingBid?.bidAmount;
+
+      if (!spotId || !advertiserUrl) {
+        setVerificationStatus({
+          status: 'error',
+          message: 'Payment received, but bid details could not be found. Please contact support.',
+        });
+        window.history.replaceState({}, '', window.location.pathname);
+        return;
+      }
+
+      setVerificationStatus({
+        status: 'verifying',
+        message: 'Payment confirmed! Finalizing your bid on the globe...',
+      });
+
+      fetch('/api/verify-payment-and-bid', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          paymentId,
+          spotId,
+          advertiserUrl,
+          logoUrl,
+          bidAmount,
+        }),
+      })
+        .then((res) => res.json())
+        .then((data) => {
+          if (data.success) {
+            setVerificationStatus({
+              status: 'success',
+              message:
+                data.message ||
+                `🎉 Region claimed successfully${pendingBid?.spotDisplayName ? ` for ${pendingBid.spotDisplayName}` : ''}!`,
+            });
+            sessionStorage.removeItem('bidthatshii_pending_bid');
+            setTimeout(() => {
+              setVerificationStatus(null);
+            }, 6000);
+          } else {
+            setVerificationStatus({
+              status: 'error',
+              message: data.message || data.error || 'Payment verification failed.',
+            });
+          }
+        })
+        .catch(() => {
+          setVerificationStatus({
+            status: 'error',
+            message:
+              'Network error during verification. Your bid will be processed automatically via webhook.',
+          });
+        })
+        .finally(() => {
+          window.history.replaceState({}, '', window.location.pathname);
+        });
+    }
+  }, []);
+
   // Log Globe mount/unmount state whenever modal opens or closes
   useEffect(() => {
     if (isModalOpen) {
@@ -82,6 +181,65 @@ export default function ActionFigureClient({ initialSpots }: ActionFigureClientP
           )}
         </div>
       </nav>
+
+      {/* Verification / Post-Payment Status Banner */}
+      {verificationStatus && (
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            padding: '14px 18px',
+            borderRadius: '12px',
+            backgroundColor:
+              verificationStatus.status === 'success'
+                ? '#ecfdf5'
+                : verificationStatus.status === 'verifying'
+                ? '#eff6ff'
+                : '#fef2f2',
+            border: `1.5px solid ${
+              verificationStatus.status === 'success'
+                ? '#10b981'
+                : verificationStatus.status === 'verifying'
+                ? '#3b82f6'
+                : '#ef4444'
+            }`,
+            color:
+              verificationStatus.status === 'success'
+                ? '#065f46'
+                : verificationStatus.status === 'verifying'
+                ? '#1e40af'
+                : '#991b1b',
+            fontSize: '14px',
+            fontWeight: 600,
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+            <span>
+              {verificationStatus.status === 'success'
+                ? '🎉'
+                : verificationStatus.status === 'verifying'
+                ? '⏳'
+                : '⚠️'}
+            </span>
+            <span>{verificationStatus.message}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setVerificationStatus(null)}
+            style={{
+              background: 'none',
+              border: 'none',
+              fontSize: '16px',
+              cursor: 'pointer',
+              color: 'inherit',
+              padding: '2px 6px',
+            }}
+          >
+            ✕
+          </button>
+        </div>
+      )}
 
       {/* Main Headline */}
       <section style={styles.heroSection}>

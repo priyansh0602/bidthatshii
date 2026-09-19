@@ -1,16 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { supabaseAdmin } from '@/lib/supabaseAdmin';
-import { razorpay } from '@/lib/razorpay';
-import { convertUsdToInrPaise } from '@/lib/currency';
+import { dodo, DODO_PRODUCT_ID } from '@/lib/dodo';
 
 /**
  * POST /api/create-payment-order
  *
- * Recalculates the required charge delta server-side and creates a Razorpay Order.
- * Never trusts the client-provided bidAmount without validation against current spot state.
+ * Recalculates the required charge delta server-side and creates a Dodo Payments Checkout Session.
+ * Never trusts client-provided bidAmount without validation against current spot state.
  *
  * Request body: { spotId, advertiserUrl, bidAmount }
- * Response: { orderId, amount, currency: 'INR', keyId }
+ * Response: { sessionId, checkoutUrl, amount, currency: 'USD', orderId }
  */
 
 function getClientIp(req: NextRequest): string {
@@ -130,41 +129,53 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // ── 4. Create Razorpay Order (convert USD delta to INR paise) ──────────
-    const amountInPaise = convertUsdToInrPaise(delta);
+    // ── 4. Create Dodo Payments Checkout Session (USD cents) ─────────────────
+    const amountInCents = Math.round(delta * 100);
 
-    const order = await razorpay.orders.create({
-      amount: amountInPaise,
-      currency: 'INR',
-      receipt: `bid_${spotId.slice(0, 8)}_${Date.now()}`.slice(0, 40),
-      notes: {
+    const origin =
+      req.headers.get('origin') ||
+      (req.headers.get('x-forwarded-proto') && req.headers.get('x-forwarded-host')
+        ? `${req.headers.get('x-forwarded-proto')}://${req.headers.get('x-forwarded-host')}`
+        : req.headers.get('host')
+        ? `http://${req.headers.get('host')}`
+        : req.nextUrl.origin);
+
+    const returnUrl = `${origin}/?dodo_verify=true&spot_id=${encodeURIComponent(spotId)}&advertiser_url=${encodeURIComponent(normalizedUrl)}`;
+
+    const session = await dodo.checkoutSessions.create({
+      product_cart: [
+        {
+          product_id: DODO_PRODUCT_ID,
+          quantity: 1,
+          amount: amountInCents,
+        },
+      ],
+      billing_currency: 'USD',
+      metadata: {
         spotId,
         advertiserUrl: normalizedUrl,
-        bidAmountUsd: String(numericBidAmount),
+        bidAmount: String(numericBidAmount),
         deltaUsd: String(delta),
-        inrPaise: String(amountInPaise),
+        clientIp,
       },
+      return_url: returnUrl,
     });
 
-    const keyId =
-      process.env.NEXT_PUBLIC_RAZORPAY_KEY_ID ||
-      process.env.RAZORPAY_KEY_ID ||
-      '';
-
     return NextResponse.json({
-      orderId: order.id,
-      amount: order.amount,
-      currency: order.currency || 'INR',
-      keyId,
+      sessionId: session.session_id,
+      checkoutUrl: session.checkout_url,
+      amount: delta,
+      currency: 'USD',
+      orderId: session.session_id,
     });
   } catch (err: unknown) {
     const errorDetails =
       err && typeof err === 'object'
         ? JSON.stringify(err, Object.getOwnPropertyNames(err))
         : String(err);
-    console.error('[create-payment-order] Error creating order:', errorDetails);
+    console.error('[create-payment-order] Error creating Dodo checkout session:', errorDetails);
     return NextResponse.json(
-      { error: 'Failed to create payment order. Please try again.' },
+      { error: 'Failed to create payment session. Please try again.' },
       { status: 500 }
     );
   }
