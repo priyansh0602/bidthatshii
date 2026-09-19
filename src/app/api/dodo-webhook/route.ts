@@ -201,7 +201,10 @@ async function checkOrphanedPaymentWithRetry(details: {
   // If still unfulfilled and metadata has spotId and advertiserUrl, attempt auto-recovery
   const spotId = metadata?.spotId;
   const advertiserUrl = metadata?.advertiserUrl;
-  const customAmount = metadata?.bidAmount ? Number(metadata.bidAmount) : undefined;
+  const customAmount =
+    (metadata?.bidAmountUsd || metadata?.bidAmount)
+      ? Number(metadata?.bidAmountUsd || metadata?.bidAmount)
+      : undefined;
   const logoUrl =
     metadata?.logoUrl ||
     (advertiserUrl

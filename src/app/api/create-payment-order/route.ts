@@ -1,15 +1,17 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { supabaseAdmin } from '@/lib/supabaseAdmin';
 import { dodo, DODO_PRODUCT_ID } from '@/lib/dodo';
+import { convertUsdToInrPaise, USD_TO_INR_RATE } from '@/lib/currency';
 
 /**
  * POST /api/create-payment-order
  *
- * Recalculates the required charge delta server-side and creates a Dodo Payments Checkout Session.
- * Never trusts client-provided bidAmount without validation against current spot state.
+ * Recalculates the required charge delta server-side in USD and creates a Dodo Payments
+ * Checkout Session in INR (converting USD delta to INR paise) so that UPI and Indian payment
+ * methods are available alongside cards in the checkout flow.
  *
  * Request body: { spotId, advertiserUrl, bidAmount }
- * Response: { sessionId, checkoutUrl, amount, currency: 'USD', orderId }
+ * Response: { sessionId, checkoutUrl, amount, amountInr, amountUsd, currency: 'INR', orderId }
  */
 
 function getClientIp(req: NextRequest): string {
@@ -129,8 +131,9 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // ── 4. Create Dodo Payments Checkout Session (USD cents) ─────────────────
-    const amountInCents = Math.round(delta * 100);
+    // ── 4. Convert USD delta to INR paise and create Dodo Checkout Session ────
+    const amountInPaise = convertUsdToInrPaise(delta);
+    const amountInInr = (amountInPaise / 100).toFixed(2);
 
     const origin =
       req.headers.get('origin') ||
@@ -147,15 +150,22 @@ export async function POST(req: NextRequest) {
         {
           product_id: DODO_PRODUCT_ID,
           quantity: 1,
-          amount: amountInCents,
+          amount: amountInPaise,
         },
       ],
-      billing_currency: 'USD',
+      billing_currency: 'INR',
+      billing_address: {
+        country: 'IN',
+      },
       metadata: {
         spotId,
         advertiserUrl: normalizedUrl,
         bidAmount: String(numericBidAmount),
+        bidAmountUsd: String(numericBidAmount),
         deltaUsd: String(delta),
+        amountInrPaise: String(amountInPaise),
+        amountInr: amountInInr,
+        exchangeRate: String(USD_TO_INR_RATE),
         clientIp,
       },
       return_url: returnUrl,
@@ -164,8 +174,10 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({
       sessionId: session.session_id,
       checkoutUrl: session.checkout_url,
-      amount: delta,
-      currency: 'USD',
+      amount: amountInPaise,
+      amountInr: Number(amountInInr),
+      amountUsd: delta,
+      currency: 'INR',
       orderId: session.session_id,
     });
   } catch (err: unknown) {
