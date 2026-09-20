@@ -5,5 +5,4 @@ const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
 
 export const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
-export { placeBid, trackClick } from './bids';
-export type { PlaceBidResult } from './bids';
+export { trackClick } from './bids';
