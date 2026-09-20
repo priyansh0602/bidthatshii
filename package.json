@@ -16,11 +16,9 @@
     "dodopayments": "^2.51.0",
     "dodopayments-checkout": "^1.9.9",
     "next": "^14.2.3",
-    "razorpay": "^2.9.8",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "three": "^0.164.1",
-    "zod": "^3.23.8"
+    "three": "^0.164.1"
   },
   "devDependencies": {
     "@types/deno": "*",

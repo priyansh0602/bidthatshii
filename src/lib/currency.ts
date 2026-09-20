@@ -7,7 +7,7 @@
 export const USD_TO_INR_RATE = 94.466;
 
 /**
- * Converts a USD amount into INR paise (the smallest currency unit Razorpay expects),
+ * Converts a USD amount into INR paise (the smallest currency unit used for INR billing),
  * rounding to the nearest whole integer paise.
  *
  * 1 USD = 94.466 INR
