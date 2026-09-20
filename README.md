@@ -1,185 +1,212 @@
 # BidThatShii
 
-**BidThatShii** is a real-time cumulative-bidding auction platform where advertisers compete to place their logo on one of 15 named regions of an interactive 3D Earth globe. The highest cumulative bidder for each region wins — their logo appears on that region's pin and links out to their website. Bids are cumulative: you only pay the *difference* needed to become the new highest bidder, not the full amount again, so early bidders are rewarded and competition stays tight. All bids, presence counts, and spot updates propagate instantly to every connected browser via Supabase Realtime — no refresh required.
+**BidThatShii** is a live, real-time bidding platform built around an interactive 3D Earth globe. Users bid to claim a region and place their logo on it — the logo is instantly live and clickable, linking directly to their site. Prices only rise, and returning bidders only pay the difference needed to reclaim the top spot, not the full price again. Live at [https://bidthatshii.live](https://bidthatshii.live).
 
 ---
 
-## Features
+## Live Product
 
-- **Interactive 3D Earth globe** — 360° rotatable globe built with Three.js / react-three-fiber, with 15 biddable regions rendered as clickable pins at real-world lat/lng coordinates
-- **Cumulative delta-payment bidding** — bidders pay only the increment above their existing contribution; early bidders are protected and cannot be fully displaced cheaply
-- **Real-time updates** — all spot state (current winner, price, logo) broadcasts via Supabase Realtime `postgres_changes`; every open tab updates live without polling
-- **Live visitor presence counter** — Supabase Realtime Presence tracks connected browser tabs and shows a live "X watching" count in the nav bar
-- **Automatic logo/favicon discovery** — `POST /api/fetch-logo` server-side fetches the submitted URL, parses HTML for `<link rel="icon">` / Open Graph images, and falls back to the Google favicon service; SSRF protection blocks private IP ranges and localhost
-- **URL reachability verification** — before a bid is accepted the submitted URL is checked for reachability server-side; unreachable URLs are rejected with a clear error
-- **Click tracking** — clicks on winning advertiser logos are counted per-spot per-advertiser via `POST /api/track-click` and displayed as a live badge in the auction feed
-- **Visit counting** — unique browser sessions are counted via `POST /api/track-visit` and displayed as a running total in the nav bar
-- **Admin dashboard** — password-protected (Supabase Auth, email + password, single authorized email) read-only dashboard showing total revenue, per-region summary, and a sortable bid event history
-- **IP-based rate limiting on all write actions** — bidding, click tracking, and visit counting all route through server-side Next.js API routes; rate limits are enforced against the real client IP (extracted from `cf-connecting-ip` / `x-forwarded-for` headers), not a client-controllable session identifier
-- **Atomic, concurrency-safe bidding** — the `place_bid` Postgres function runs inside a transaction with row-level locking; simultaneous bids cannot produce double-charges or inconsistent state
-- **Service-role key isolation** — the Supabase `service_role` key is only ever used server-side in `/src/lib/supabaseAdmin.ts`; the browser only receives the public anon key
+BidThatShii is launched and in active production use at **[https://bidthatshii.live](https://bidthatshii.live)**. This documentation describes the current production architecture and live deployment, not a work-in-progress or planned roadmap.
+
+---
+
+## Key Features
+
+- **360° Rotatable 3D Earth Globe**: Built using Three.js and `@react-three/fiber` with orbital controls, rendering 15 biddable geographic regions pinned at accurate latitude/longitude coordinates with spherical vector math (`latLngToVector3`).
+- **Cumulative Delta-Payment Bidding**: Bidders only pay the financial increment required to outbid the current leader (`target_bid - existing_contribution`), protecting previous capital contributions and keeping regional competition intense.
+- **Instant Real-Time Synchronization**: All spot price updates, ownership changes, and live clicks broadcast instantaneously across every connected client using Supabase Realtime (`postgres_changes` WebSocket channels) without polling.
+- **Live Visitor Presence Counter**: Supabase Realtime Presence (`site-presence` channel) monitors active concurrent browser connections with deduplicated session identifiers and displays a live "watching" badge.
+- **Automated Logo & Favicon Discovery**: A server-side discovery pipeline fetches submitted URLs, parses HTML for `<link rel="icon">`, `apple-touch-icon`, `og:image`, and `twitter:image` tags, checks `/favicon.ico`, validates image magic bytes and content types, and cascades to the Google Favicon Service with a guaranteed local fallback (`/default-globe.svg`).
+- **URL Reachability Verification & SSRF Protection**: Validates destination URLs with HTTP timeouts and strict server-side request forgery (SSRF) guards that block private IPv4/IPv6 ranges (RFC 1918), loopback interfaces, carrier-grade NAT, and cloud metadata endpoints (`169.254.169.254`, `metadata.google.internal`).
+- **Logo Click Tracking with Instant Redirect**: Outbound clicks on claimed region pins and cards are asynchronously recorded via `/api/track-click` (backed by the `increment_click` Postgres RPC) before redirecting users to the advertiser's website.
+- **Live Global Payments via Dodo Payments**: Seamless checkout supporting international credit/debit cards and Indian UPI. Pricing is displayed in USD while processed in INR paise via Dodo Payments checkout sessions with server-side SDK signature verification and an asynchronous webhook recovery worker.
+- **Protected Admin Dashboard**: Read-only internal dashboard (`/admin`) presenting aggregated platform revenue (`admin_total_revenue`), per-region performance breakdowns (`admin_spot_summary`), and sortable historical bid records, secured with Supabase Auth session cookies and strict email allowlisting.
+- **Server-Side IP Rate Limiting**: All mutation endpoints (`/api/create-payment-order`, `/api/verify-payment-and-bid`, `/api/track-click`, `/api/track-visit`, and `/api/fetch-logo`) enforce rate limits against real client IPs extracted from proxy headers (`cf-connecting-ip`, `x-forwarded-for`, `x-real-ip`).
+- **Atomic Concurrency-Safe Bidding**: The Postgres `place_bid` stored procedure executes within an isolated transaction utilizing row-level locking (`FOR UPDATE`), ensuring concurrent bids never create race conditions, partial writes, or inconsistent winner states.
+- **Graceful WebGL Fallback UI**: Proactive WebGL context probing detects disabled hardware acceleration or unsupported environments, cleanly rendering an interactive fallback interface (`GlobeFallback`) while keeping the entire auction functional.
 
 ---
 
 ## Tech Stack
 
-| Layer | Technology |
-|---|---|
-| Framework | [Next.js 14](https://nextjs.org/) (App Router, server components + API routes) |
-| Language | TypeScript |
-| UI | React 18 |
-| 3D Globe | [Three.js](https://threejs.org/) via [react-three-fiber](https://docs.pmnd.rs/react-three-fiber) + [@react-three/drei](https://github.com/pmndrs/drei) |
-| Database | [Supabase](https://supabase.com/) — hosted PostgreSQL with Row Level Security |
-| Auth | Supabase Auth (email + password, restricted to a single admin email) |
-| Realtime | Supabase Realtime (`postgres_changes` + Presence) |
-| Styling | Vanilla CSS-in-JS (React inline `style` props) — no Tailwind or CSS framework |
-| Validation | [Zod](https://zod.dev/) |
+| Layer | Technology | Description |
+|---|---|---|
+| **Framework** | [Next.js 14](https://nextjs.org/) | App Router with React Server Components, dynamic streaming, and Route Handlers |
+| **Language** | [TypeScript](https://www.typescriptlang.org/) | End-to-end static typing across database schemas, APIs, and client components |
+| **Frontend UI** | [React 18](https://react.dev/) | Client and server components |
+| **3D Rendering** | [Three.js](https://threejs.org/) / [R3F](https://docs.pmnd.rs/react-three-fiber) | `@react-three/fiber` and `@react-three/drei` for interactive 3D canvas and orbital scene controls |
+| **Database & Auth** | [Supabase](https://supabase.com/) | Hosted PostgreSQL, Row Level Security (RLS), Supabase Auth (`@supabase/ssr`), and Realtime WebSockets |
+| **Payments** | [Dodo Payments](https://dodopayments.com/) | Server SDK (`dodopayments`) and checkout overlay client (`dodopayments-checkout`) supporting cards & UPI |
+| **Styling** | Vanilla CSS & CSS Variables | Native CSS custom properties (`globals.css`) paired with modular inline style objects — zero CSS frameworks or Tailwind dependencies |
+| **Hosting & Edge** | [Vercel](https://vercel.com/) | Edge middleware, serverless functions, and global CDN delivery |
 
 ---
 
 ## Project Structure
 
 ```
-/
+bidthatshii/
 ├── src/
 │   ├── app/
-│   │   ├── layout.tsx              # Root layout — metadata, global CSS
-│   │   ├── page.tsx                # Main page — globe, auction feed, presence bar
-│   │   ├── globals.css             # Minimal global reset
+│   │   ├── layout.tsx                # Root HTML layout and global metadata
+│   │   ├── page.tsx                  # Server Component: initial cached spots fetch (5s revalidate)
+│   │   ├── ActionFigureClient.tsx    # Primary client component: 3D globe, feed, presence, and alerts
+│   │   ├── globals.css               # Design tokens (CSS custom properties) and keyframe animations
 │   │   ├── admin/
-│   │   │   ├── page.tsx            # Admin dashboard (Server Component)
-│   │   │   ├── AdminTables.tsx     # Sortable spot summary + bid history tables
-│   │   │   ├── LogoutButton.tsx    # Client component — calls supabase.auth.signOut()
-│   │   │   ├── types.ts            # Admin-specific TypeScript types
+│   │   │   ├── page.tsx              # Admin dashboard Server Component (dynamic, no-store fetch)
+│   │   │   ├── AdminTables.tsx       # Client component: sortable region summary and bid event tables
+│   │   │   ├── LogoutButton.tsx      # Admin sign-out button
+│   │   │   ├── types.ts              # Admin dashboard data interfaces
 │   │   │   └── login/
-│   │   │       └── page.tsx        # Admin login page (email + password)
-│   │   └── api/
-│   │       ├── fetch-logo/         # POST — server-side logo/favicon discovery + SSRF guard
-│   │       ├── place-bid/          # POST — rate-limited, service-role bid placement
-│   │       ├── track-click/        # POST — rate-limited click counter
-│   │       └── track-visit/        # POST — rate-limited visit counter
+│   │   │       └── page.tsx          # Cookie-based admin authentication using @supabase/ssr
+│   │   ├── api/
+│   │   │   ├── create-payment-order/ # POST: calculates USD delta, converts to INR paise, creates Dodo session
+│   │   │   ├── verify-payment-and-bid/# POST: validates payment with Dodo SDK and executes place_bid RPC
+│   │   │   ├── dodo-webhook/         # POST: Standard Webhooks HMAC verification and orphaned bid recovery
+│   │   │   ├── fetch-logo/           # POST: SSRF-protected URL verification and icon discovery pipeline
+│   │   │   ├── track-click/          # POST: IP-rate-limited proxy to increment_click RPC
+│   │   │   └── track-visit/          # POST: IP-rate-limited proxy to increment_visit_count RPC
+│   │   └── terms/
+│   │       └── page.tsx              # Terms of Service and platform policies
 │   ├── components/
-│   │   ├── Globe.tsx               # Three.js canvas, Earth sphere, region pins
-│   │   ├── RegionPin.tsx           # Per-spot 3D pin with winner logo or placeholder
-│   │   └── BidModal.tsx            # Bid flow modal — URL input, logo preview, bid submission
+│   │   ├── Globe.tsx                 # 3D Earth sphere with orbital controls and WebGL error boundary
+│   │   ├── GlobeFallback.tsx         # Non-WebGL fallback message retaining layout geometry
+│   │   ├── RegionPin.tsx             # 3D HTML marker positioned via lat/long coordinates with camera culling
+│   │   └── BidModal.tsx              # Modal handling URL input, logo preview, delta calculation, and Dodo checkout
 │   ├── hooks/
-│   │   ├── useRealtimeSpots.ts     # Fetches spots + subscriptions to realtime changes
-│   │   ├── usePresence.ts          # Live viewer count via Supabase Realtime Presence
-│   │   └── useSiteStats.ts         # Visit counter — calls /api/track-visit once per session
+│   │   ├── usePresence.ts            # Manages live connection tracking via Supabase Realtime Presence
+│   │   ├── useRealtimeSpots.ts       # Subscribes to spots & contribution click changes via WebSockets
+│   │   └── useSiteStats.ts           # Tracks unique session visits and synchronizes live count updates
 │   ├── lib/
-│   │   ├── supabase.ts             # Public anon Supabase client (browser-safe)
-│   │   ├── supabaseAdmin.ts        # Service-role Supabase client (server-only — never import in client components)
-│   │   ├── bids.ts                 # placeBid() and trackClick() — fetch wrappers for API routes
-│   │   └── getClientIdentifier.ts  # Legacy session UUID helper (kept for reference; no longer used for rate limiting)
-│   ├── middleware.ts               # Protects /admin — validates Supabase Auth session + ADMIN_EMAIL gate
+│   │   ├── bids.ts                   # Client-side fire-and-forget click tracking helper
+│   │   ├── currency.ts               # USD-to-INR conversion logic (fixed rate to INR paise)
+│   │   ├── dodo.ts                   # Server-only Dodo Payments SDK client instance
+│   │   ├── latLngToVector3.ts        # Mathematical projection from latitude/longitude to 3D Cartesian coordinates
+│   │   ├── supabase.ts               # Browser-safe public Supabase client (anon key)
+│   │   └── supabaseAdmin.ts          # Server-only administrative Supabase client (service_role key)
+│   ├── middleware.ts                 # Edge middleware enforcing valid session & ADMIN_EMAIL for /admin
 │   └── types/
-│       └── spot.ts                 # Spot interface matching the `spots` Postgres table
+│       └── spot.ts                   # TypeScript definition matching the `spots` PostgreSQL schema
 ├── supabase/
-│   ├── config.toml                 # Supabase CLI project config
+│   ├── config.toml                   # Local Supabase CLI configuration
 │   ├── functions/
-│   │   └── health/                 # Edge Function — health check returning { status: "ok", ... }
+│   │   └── health/                   # Edge Function health-check
 │   └── migrations/
-│       └── 20260830000000_init.sql # Phase 0 scaffolding (the full schema lives in Supabase directly)
-├── .env.example                    # Environment variable template — copy to .env
-├── .gitignore
-└── package.json
+│       └── 20260830000000_init.sql   # Initial schema migration
+├── scripts/
+│   ├── test-dodo-checkout.ts         # Automated test: product retrieval, currency conversion & session creation
+│   ├── test-dodo-webhook.ts          # Automated test: HMAC signature validation & payload tampering checks
+│   └── test-fetch-logo-api.ts        # Automated test: logo discovery pipeline across diverse domain targets
+├── .env.example                      # Template defining required environment variables
+├── package.json                      # Project dependencies, build scripts, and metadata
+└── tsconfig.json                     # TypeScript compiler configuration
 ```
-
-> **Note on migrations:** The full production schema (tables, RLS policies, Postgres functions, views) was applied directly to the Supabase project. Only the initial scaffolding migration is tracked in `supabase/migrations/`. If you are setting up a new Supabase project from scratch, the schema will need to be recreated manually or via a dump from the existing project.
 
 ---
 
 ## Environment Variables
 
-Copy `.env.example` to `.env` and fill in real values. **Never commit `.env`** — it is git-ignored.
+All variables referenced in `.env.example` must be configured for the application to function:
 
-| Variable | Required | Description |
-|---|---|---|
-| `NEXT_PUBLIC_SUPABASE_URL` | ✅ | Your Supabase project URL (safe to expose to the browser) |
-| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | ✅ | Supabase anon/public key (safe to expose to the browser; subject to RLS) |
-| `SUPABASE_SERVICE_ROLE_KEY` | ✅ | Supabase service role key — **server-side only**; bypasses RLS; never sent to the browser |
-| `ADMIN_EMAIL` | ✅ | Email address of the single Supabase Auth user allowed to access `/admin` |
-| `ADMIN_PASSWORD` | ⚠️ | Legacy shared-password field from the old auth system — no longer used for login; can be removed |
-| `ADMIN_SESSION_SECRET` | ⚠️ | Legacy HMAC signing secret from the old cookie-based auth — no longer used; can be removed |
+| Variable | Description |
+|---|---|
+| `NEXT_PUBLIC_SUPABASE_URL` | Public URL for your Supabase project instance (accessible by the browser). |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Public anonymous API key for client-side queries (enforces Row Level Security). |
+| `SUPABASE_SERVICE_ROLE_KEY` | Secret administrative key for server-side operations (bypasses RLS; never exposed to browser). |
+| `ADMIN_EMAIL` | Specific email address authorized to access the `/admin` dashboard. |
+| `DODO_API_KEY` | Secret API key used by the backend to authenticate with the Dodo Payments API. |
+| `DODO_PRODUCT_ID` | Dodo Payments Product ID configured with pay-what-you-want pricing in USD. |
+| `NEXT_PUBLIC_DODO_MODE` | Payment operational mode (`test` or `live`) configuring the Dodo Checkout overlay. |
+| `DODO_WEBHOOK_SECRET` | Secret key used to verify Standard Webhooks HMAC signatures on incoming Dodo webhook payloads. |
 
 ---
 
-## Getting Started
+## Local Development Setup
 
 ### Prerequisites
 
-- Node.js ≥ 18
-- A [Supabase](https://supabase.com/) project with the BidThatShii schema applied (see note above)
-- The admin Supabase Auth user created in your Supabase project (Authentication → Users → Add user)
+- **Node.js**: Version 18.17.0 or higher
+- **Supabase Project**: An active Supabase project with database schema, functions (`place_bid`, `increment_click`, `increment_visit_count`, `check_rate_limit`), and views (`admin_total_revenue`, `admin_spot_summary`)
+- **Dodo Payments Account**: An account with test mode enabled and a pay-what-you-want product configured
 
-### Installation
+### Installation Steps
 
-```bash
-# 1. Clone the repository
-git clone https://github.com/your-username/bidthatshii.git
-cd bidthatshii
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/your-username/bidthatshii.git
+   cd bidthatshii
+   ```
 
-# 2. Install dependencies
-npm install
+2. **Install dependencies:**
+   ```bash
+   npm install
+   ```
 
-# 3. Configure environment variables
-cp .env.example .env
-# Edit .env and fill in your Supabase credentials and ADMIN_EMAIL
+3. **Configure environment variables:**
+   ```bash
+   cp .env.example .env
+   ```
+   Open `.env` and provide your credentials for Supabase, Dodo Payments, and the administrator email.
 
-# 4. Run the development server
-npm run dev
+4. **Verify payment and API integrations (optional):**
+   ```bash
+   # Test Dodo checkout session creation and currency conversion
+   npx tsx scripts/test-dodo-checkout.ts
+
+   # Test webhook signature verification logic
+   npx tsx scripts/test-dodo-webhook.ts
+
+   # Test logo discovery pipeline against live domains
+   npx tsx scripts/test-fetch-logo-api.ts
+   ```
+
+5. **Start the local development server:**
+   ```bash
+   npm run dev
+   ```
+
+6. **Access the application:**
+   - Public Globe & Auction: [http://localhost:3000](http://localhost:3000)
+   - Admin Dashboard: [http://localhost:3000/admin](http://localhost:3000/admin) (Log in with the account corresponding to `ADMIN_EMAIL`)
+
+---
+
+## Security & Architecture Notes
+
+### Server-Side API Isolation & Service-Role Client
+All state-mutating operations — placing bids, recording advertiser clicks, and incrementing unique visits — execute exclusively through Next.js server-side Route Handlers (`/api/*`). These routes utilize a private `supabaseAdmin` client initialized with `SUPABASE_SERVICE_ROLE_KEY`. Direct browser invocation of sensitive database functions is blocked, ensuring that client-side manipulation of headers, parameters, or session storage cannot bypass business rules.
+
+### Defensive Postgres Grants & Revocations
+As a defense-in-depth measure beyond Row Level Security (RLS), public database roles (`anon` and `authenticated`) have had explicit table and function privileges revoked in Postgres:
+```sql
+REVOKE EXECUTE ON FUNCTION place_bid FROM anon, authenticated;
+REVOKE EXECUTE ON FUNCTION increment_click FROM anon, authenticated;
+REVOKE EXECUTE ON FUNCTION increment_visit_count FROM anon, authenticated;
 ```
+Because anonymous and authenticated users cannot invoke these functions directly via the Supabase REST/RPC API, the only execution pathway is through the backend API routes where rate limiting and payment verification are strictly enforced.
 
-Open [http://localhost:3000](http://localhost:3000) to see the app.  
-The admin dashboard is at [http://localhost:3000/admin](http://localhost:3000/admin) — requires valid Supabase Auth credentials.
+### Real Client IP Rate Limiting
+Rate limiting does not rely on client-supplied UUIDs or browser cookies, which are easily cleared or spoofed. Instead, the backend extracts the verified client IP from trusted reverse-proxy headers (`cf-connecting-ip`, `x-forwarded-for`, `x-real-ip`) and evaluates limits via the `check_rate_limit` Postgres RPC.
 
-### Supabase Setup Notes
+### URL Normalization for Consistent Identity Matching
+Advertiser URLs are systematically sanitized and normalized prior to database storage and contribution checks (converting to lowercase, trimming whitespace, stripping duplicate trailing slashes, and prefixing `https://`). This guarantees that `example.com`, `http://example.com`, and `https://example.com/` resolve to the exact same advertiser identity record, preventing fragmented contribution totals and ensuring returning bidders receive credit for previous payments.
 
-- **Disable sign-ups** in Supabase dashboard → Authentication → Settings → "Enable email signup" (off) so only the manually created admin user can ever have an account
-- **Revoke anon execute permissions** on `place_bid`, `increment_click`, and `increment_visit_count` so they can only be called via the service role key (server-side API routes):
-  ```sql
-  REVOKE EXECUTE ON FUNCTION place_bid FROM anon, authenticated;
-  REVOKE EXECUTE ON FUNCTION increment_click FROM anon, authenticated;
-  REVOKE EXECUTE ON FUNCTION increment_visit_count FROM anon, authenticated;
-  ```
-- **Session length** is configured in Supabase dashboard → Authentication → Settings → JWT expiry & Token refresh interval (no code change needed)
-
----
-
-## Key Architectural Decisions
-
-### Why bidding, click tracking, and visit counting go through server-side API routes
-
-In early versions, these actions called `supabase.rpc()` directly from the browser using the public anon key. The problem: anyone could use the anon key from outside the app to call `place_bid` directly — bypassing rate limits entirely (since the old limits relied on session UUIDs stored in `sessionStorage`, which are trivially clearable). The fix:
-
-1. The `place_bid`, `increment_click`, and `increment_visit_count` Postgres functions have their `EXECUTE` permission **revoked from `anon` and `authenticated`** — they can only be called via the `service_role` key
-2. Three Next.js API routes (`/api/place-bid`, `/api/track-click`, `/api/track-visit`) act as the only allowed callers, using the service-role client server-side
-3. Rate limiting in these routes is enforced against the **real client IP** extracted from request headers (`cf-connecting-ip` → `x-forwarded-for` → `x-real-ip`) — a server-verified value that a browser cannot spoof
-
-### URL normalization before identity matching
-
-When a bidder submits a URL, it is normalized (scheme added if missing, trailing slashes stripped, lowercased) before being stored and compared. This ensures that `example.com`, `http://example.com`, and `https://example.com/` all resolve to the same advertiser identity. Without normalization, the same advertiser could accidentally create multiple independent contributions to the same spot, or be unable to reclaim their existing bid.
-
-### The cumulative-payment bidding mechanic
-
-Each spot tracks a `current_highest_total` — the total amount the leading bidder has cumulatively paid. When you place a bid, you specify a target total (must be ≥ `current_highest_total + min_increment`). The `place_bid` function looks up how much you have already contributed to this spot from your URL. **You are only charged the difference** (`your target total` − `your existing contribution`). This means:
-
-- If you are already the highest bidder and someone outbids you, you can reclaim the top spot by paying only the increment above theirs — you do not lose your prior contribution
-- Early bidders are incentivised to bid higher upfront to reduce future top-up costs
-- All calculations happen inside a single Postgres transaction with row-level locking, preventing race conditions under simultaneous bids
+### The Cumulative Delta-Payment Mechanic
+Each spot tracks the leader's cumulative investment in `current_highest_total`. When placing a bid, the bidder inputs their target total (which must satisfy `target >= current_highest_total + min_increment`). The system queries the `contributions` table for prior amounts contributed by that specific advertiser URL on that spot:
+$$\text{Amount Due} = \max(0, \text{Target Bid} - \text{Existing Contribution})$$
+- Returning bidders only pay the difference required to take the lead.
+- The `place_bid` stored procedure locks the relevant row in `spots` (`SELECT ... FOR UPDATE`), performs validation, records a `bid_events` audit entry, updates the `contributions` ledger, and assigns the new winner in an atomic transaction.
 
 ---
 
-## Known Limitations / Not Yet Implemented
+## Known Limitations
 
-- **No payment gating** — bids are currently **free** (no Stripe or other payment processor is connected). This is a pre-launch status. The bidding mechanic, rate limiting, and atomic accounting are fully implemented, but no real money is collected or charged. **Do not launch publicly with real advertiser expectations until payment is integrated.**
-- **No content moderation** — submitted advertiser URLs are checked for reachability and basic SSRF safety, but logo images and destination URLs are not reviewed for inappropriate content beyond that
-- **Admin panel has no 2FA** — the admin dashboard is protected by Supabase Auth (email + password) with a single-email gate in middleware, but no second factor is enforced
-- **In-memory rate limiting on `/api/fetch-logo`** — this route uses a simple in-memory request log rather than the Postgres-backed `check_rate_limit` function used by the other routes; in a multi-instance deployment (e.g. Vercel serverless functions with concurrent cold starts), this limiter will not be shared across instances
-- **Full schema not tracked as migrations** — the production Supabase schema was applied directly to the project rather than being fully codified as versioned migration files; a fresh environment requires a manual schema setup
+- **Automated Content Moderation Only**: Beyond automated SSRF prevention, URL protocol verification, and image header validation, there is no manual human review pipeline or automated NSFW image filtering on submitted advertiser logos and destination links.
+- **Single-Email Admin Access**: The administration portal restricts access using a single hardcoded `ADMIN_EMAIL` environment variable checked in Edge middleware, rather than a multi-user Role-Based Access Control (RBAC) permissions matrix.
+- **Fixed Currency Exchange Rate**: The USD-to-INR conversion uses a fixed calculation rate (`USD_TO_INR_RATE = 94.466`) in `src/lib/currency.ts` rather than fetching dynamic, real-time FX market rates via a live foreign exchange API.
 
 ---
 
 ## License
 
-License TBD — all rights reserved until a license is chosen.
+All rights reserved. Proprietary software — see project repository terms for licensing updates.
